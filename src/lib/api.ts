@@ -180,7 +180,7 @@ async function handleAppSyncPost(path: string, body: Record<string, any>, token?
     const data = await graphqlRequest<{ sendVerificationOtp: any }>(
       `mutation AppSyncSendOtp($email: String!, $purpose: String, $recipientName: String, $entityName: String) {
         sendVerificationOtp(email: $email, purpose: $purpose, recipientName: $recipientName, entityName: $entityName) {
-          message email expiresInSeconds devOtp
+          message email expiresInSeconds
         }
       }`,
       body
@@ -204,7 +204,7 @@ async function handleAppSyncPost(path: string, body: Record<string, any>, token?
     const data = await graphqlRequest<{ forgotPassword: any }>(
       `mutation AppSyncForgotPassword($email: String!) {
         forgotPassword(email: $email) {
-          message email expiresInSeconds devOtp
+          message email expiresInSeconds
         }
       }`,
       { email: body.email }
