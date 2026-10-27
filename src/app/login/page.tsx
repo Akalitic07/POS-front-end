@@ -36,7 +36,6 @@ function LoginForm() {
   const [resetLoading, setResetLoading] = useState(false);
   const [resetError, setResetError] = useState("");
   const [resetSuccess, setResetSuccess] = useState("");
-  const [resetDevOtp, setResetDevOtp] = useState<string | null>(null);
   const [timerSeconds, setTimerSeconds] = useState(90);
   const [timerActive, setTimerActive] = useState(false);
 
@@ -175,13 +174,12 @@ function LoginForm() {
     setResetSuccess("");
 
     try {
-      const data = await postJson<{ message: string; expiresInSeconds?: number; devOtp?: string }>("/api/auth/forgot-password", {
+      const data = await postJson<{ message: string; expiresInSeconds?: number }>("/api/auth/forgot-password", {
         email: resetEmail.trim(),
       });
       setResetStep("otp");
       setTimerSeconds(data.expiresInSeconds || 90);
       setTimerActive(true);
-      setResetDevOtp(data.devOtp || null);
       setResetSuccess(data.message);
     } catch (err: any) {
       setResetError(err?.message || "Failed to send verification code.");
@@ -195,12 +193,11 @@ function LoginForm() {
     setResetLoading(true);
     setResetError("");
     try {
-      const data = await postJson<{ message: string; expiresInSeconds?: number; devOtp?: string }>("/api/auth/forgot-password", {
+      const data = await postJson<{ message: string; expiresInSeconds?: number }>("/api/auth/forgot-password", {
         email: resetEmail.trim(),
       });
       setTimerSeconds(data.expiresInSeconds || 90);
       setTimerActive(true);
-      setResetDevOtp(data.devOtp || null);
       setResetSuccess("✓ New code sent! (Valid for 90s)");
     } catch (err: any) {
       setResetError(err?.message || "Failed to resend code.");
@@ -335,7 +332,6 @@ function LoginForm() {
                   setResetConfirmPassword("");
                   setResetError("");
                   setResetSuccess("");
-                  setResetDevOtp(null);
                   setResetStep("email");
                   setTimerActive(false);
                   setResetModalOpen(true);
@@ -460,25 +456,6 @@ function LoginForm() {
                   </div>
                 </div>
               </div>
-
-              {resetDevOtp && (
-                <div className="rounded-xl border border-amber-300 dark:border-amber-700/60 bg-amber-50 dark:bg-amber-950/40 p-2.5 text-xs text-amber-900 dark:text-amber-200 flex items-center justify-between gap-2 shadow-sm">
-                  <div className="flex items-center gap-1.5 flex-wrap">
-                    <span className="font-bold">🛠️ Dev Mode OTP:</span>
-                    <span className="font-mono font-black text-sm tracking-widest text-[#173c32] dark:text-[#edd3ab] bg-white dark:bg-black/40 px-2 py-0.5 rounded-lg border border-amber-200 dark:border-white/10">
-                      {resetDevOtp}
-                    </span>
-                  </div>
-                  <button
-                    type="button"
-                    onClick={() => setResetOtp(resetDevOtp)}
-                    className="shrink-0 rounded-lg bg-amber-200 dark:bg-amber-900/60 hover:bg-amber-300 dark:hover:bg-amber-800 px-2.5 py-1 text-[11px] font-bold text-amber-900 dark:text-amber-100 transition touch-manipulation"
-                    title="Fill 6-digit code automatically"
-                  >
-                    Auto-Fill
-                  </button>
-                </div>
-              )}
 
               <div>
                 <div className="flex items-center justify-between mb-1">

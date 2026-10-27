@@ -23,7 +23,6 @@ export function EmailOtpVerifier({
   disabled = false,
 }: EmailOtpVerifierProps) {
   const [otp, setOtp] = useState("");
-  const [devCode, setDevCode] = useState<string | null>(null);
   const [sending, setSending] = useState(false);
   const [verifying, setVerifying] = useState(false);
   const [otpSent, setOtpSent] = useState(false);
@@ -73,16 +72,13 @@ export function EmailOtpVerifier({
     setSending(true);
 
     try {
-      const res = await postJson<{ message: string; expiresInSeconds?: number; devOtp?: string }>(
+      const res = await postJson<{ message: string; expiresInSeconds?: number }>(
         "/api/auth/send-verification-otp",
         { email: email.trim().toLowerCase(), purpose }
       );
       setOtpSent(true);
       setTimeLeft(res.expiresInSeconds || 90);
       setSuccessNotice(res.message || "Verification code sent to your email.");
-      if (res.devOtp) {
-        setDevCode(res.devOtp);
-      }
       setOtp("");
     } catch (err: any) {
       setError(err?.message || "Failed to send verification code. Please check your email.");
@@ -183,25 +179,6 @@ export function EmailOtpVerifier({
           <p className="text-[11px] text-[#5d665f] dark:text-[#a0ada5]">
             A 6-digit code was sent to <strong className="text-[#173c32] dark:text-white">{email}</strong>. Please check your inbox.
           </p>
-
-          {devCode && (
-            <div className="rounded-xl border border-amber-300 dark:border-amber-700/60 bg-amber-50 dark:bg-amber-950/40 p-2.5 text-xs text-amber-900 dark:text-amber-200 flex items-center justify-between gap-2 shadow-sm">
-              <div className="flex items-center gap-1.5 flex-wrap">
-                <span className="font-bold">🛠️ Dev Mode OTP:</span>
-                <span className="font-mono font-black text-sm tracking-widest text-[#173c32] dark:text-[#edd3ab] bg-white dark:bg-black/40 px-2 py-0.5 rounded-lg border border-amber-200 dark:border-white/10">
-                  {devCode}
-                </span>
-              </div>
-              <button
-                type="button"
-                onClick={() => setOtp(devCode)}
-                className="shrink-0 rounded-lg bg-amber-200 dark:bg-amber-900/60 hover:bg-amber-300 dark:hover:bg-amber-800 px-2.5 py-1 text-[11px] font-bold text-amber-900 dark:text-amber-100 transition touch-manipulation"
-                title="Fill 6-digit code automatically"
-              >
-                Auto-Fill
-              </button>
-            </div>
-          )}
 
           <div className="flex items-center gap-2">
             <input

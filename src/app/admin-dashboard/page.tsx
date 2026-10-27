@@ -16,7 +16,13 @@ type Tenant = {
   id: string;
   name: string;
   slug: string;
-  status: "active" | "suspended";
+  status: "active" | "suspended" | "pending_payment" | "pending_approval" | "rejected";
+  contactEmail?: string;
+  paymentSenderName?: string;
+  paymentMethod?: string;
+  paymentAccount?: string;
+  paymentSubmittedAt?: string;
+  rejectionReason?: string;
   createdAt: string;
 };
 
@@ -180,6 +186,24 @@ export default function AdminDashboard() {
     }
   };
 
+  // ── Review Tenant Payment (NayaPay Approval / Rejection) ───────────────────
+  const handleReviewTenantPayment = async (tenant: Tenant, action: "approve" | "reject") => {
+    if (!token) return;
+    try {
+      const res = await postJson<{ message: string }>(`/api/tenants/${tenant.id}/review-payment`, { action }, token);
+      setFeedback({
+        type: "success",
+        text: res.message || `Store "${tenant.name}" has been ${action === "approve" ? "approved & activated" : "rejected"}.`,
+      });
+      await loadData();
+    } catch (err) {
+      setFeedback({
+        type: "error",
+        text: err instanceof Error ? err.message : `Failed to ${action} store.`,
+      });
+    }
+  };
+
   // ── Delete user ───────────────────────────────────────────────────────────
   const handleDeleteUser = async () => {
     if (!deleteUser || !token) return;
@@ -237,6 +261,8 @@ export default function AdminDashboard() {
 
   const activeTenants = tenants.filter((t) => t.status === "active").length;
   const suspendedTenants = tenants.filter((t) => t.status === "suspended").length;
+
+  const pendingApprovalTenants = tenants.filter((t) => t.status === "pending_approval");
 
   const tenantName = (tenantId: string) =>
     tenants.find((t) => t.id === tenantId)?.name ?? tenantId.slice(0, 8) + "…";
@@ -322,6 +348,72 @@ export default function AdminDashboard() {
               </SectionCard>
             </div>
 
+            {/* Pending NayaPay Payment Approvals Section */}
+            {pendingApprovalTenants.length > 0 && (
+              <div id="approvals-section" className="rounded-3xl border-2 border-amber-300 dark:border-amber-700/60 bg-amber-50/60 dark:bg-amber-950/20 p-5 sm:p-6 shadow-sm">
+                <div className="flex items-center justify-between gap-3 mb-4">
+                  <div>
+                    <span className="text-[10px] font-black uppercase tracking-wider text-amber-800 dark:text-amber-400 bg-amber-100 dark:bg-amber-900/60 px-2.5 py-1 rounded-md">
+                      Action Required
+                    </span>
+                    <h3 className="text-base font-black text-[#173c32] dark:text-white mt-1">
+                      Store Approval Requests (NayaPay Payment Verification)
+                    </h3>
+                  </div>
+                  <span className="rounded-full bg-amber-500 text-white font-bold text-xs px-2.5 py-0.5">
+                    {pendingApprovalTenants.length} Pending
+                  </span>
+                </div>
+
+                <div className="space-y-3">
+                  {pendingApprovalTenants.map((t) => (
+                    <div
+                      key={t.id}
+                      className="rounded-2xl border border-amber-200 dark:border-white/10 bg-white dark:bg-white/[0.04] p-4 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4"
+                    >
+                      <div>
+                        <div className="flex items-center gap-2">
+                          <span className="text-sm font-black text-[#173c32] dark:text-white">{t.name}</span>
+                          <span className="text-xs font-mono text-[#5d665f] dark:text-[#a0ada5]">({t.slug})</span>
+                        </div>
+                        <div className="mt-1 text-xs text-[#5d665f] dark:text-[#a0ada5] flex flex-wrap gap-x-4 gap-y-1">
+                          <span>
+                            NayaPay Sender:{" "}
+                            <strong className="text-[#173c32] dark:text-white font-mono bg-amber-100 dark:bg-amber-950/60 px-1.5 py-0.5 rounded">
+                              {t.paymentSenderName || "Not provided"}
+                            </strong>
+                          </span>
+                          <span>Account: <strong>03217253923</strong></span>
+                          {t.paymentSubmittedAt && (
+                            <span>
+                              Submitted: {new Date(t.paymentSubmittedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", day: "numeric", month: "short" })}
+                            </span>
+                          )}
+                        </div>
+                      </div>
+
+                      <div className="flex items-center gap-2 w-full sm:w-auto">
+                        <button
+                          type="button"
+                          onClick={() => handleReviewTenantPayment(t, "approve")}
+                          className="flex-1 sm:flex-none rounded-xl bg-emerald-600 hover:bg-emerald-700 px-4 py-2 text-xs font-bold text-white transition touch-manipulation shadow-sm"
+                        >
+                          ✓ Accept & Activate
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleReviewTenantPayment(t, "reject")}
+                          className="flex-1 sm:flex-none rounded-xl bg-red-100 dark:bg-red-950/60 hover:bg-red-200 text-red-700 dark:text-red-300 px-3 py-2 text-xs font-bold transition touch-manipulation"
+                        >
+                          ✕ Reject
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
             {/* Tenant management */}
             <div id="tenants-section">
               <SectionCard
@@ -362,54 +454,89 @@ export default function AdminDashboard() {
                       { header: "Slug", accessor: "slug" },
                       {
                         header: "Status",
-                        accessor: (t) => (
-                          <span
-                            className={`inline-block rounded-full px-2.5 py-0.5 text-xs font-bold uppercase tracking-wide ${
-                              t.status === "active"
-                                ? "bg-green-100 dark:bg-green-950/60 text-green-800 dark:text-green-300"
-                                : "bg-red-100 dark:bg-red-950/60 text-red-800 dark:text-red-300"
-                            }`}
-                          >
-                            {t.status}
-                          </span>
-                        ),
+                        accessor: (t) => {
+                          const statusStyles: Record<string, string> = {
+                            active: "bg-emerald-100 dark:bg-emerald-950/60 text-emerald-800 dark:text-emerald-300 border border-emerald-300",
+                            pending_approval: "bg-amber-100 dark:bg-amber-950/60 text-amber-800 dark:text-amber-300 border border-amber-300 font-black",
+                            pending_payment: "bg-stone-100 dark:bg-white/10 text-stone-700 dark:text-stone-300",
+                            rejected: "bg-red-100 dark:bg-red-950/60 text-red-800 dark:text-red-300 border border-red-300",
+                            suspended: "bg-stone-200 dark:bg-white/20 text-stone-800 dark:text-stone-200",
+                          };
+                          const labelMap: Record<string, string> = {
+                            active: "Active",
+                            pending_approval: "Pending Approval",
+                            pending_payment: "Awaiting Payment",
+                            rejected: "Rejected",
+                            suspended: "Suspended",
+                          };
+                          return (
+                            <span
+                              className={`inline-block rounded-full px-2.5 py-0.5 text-[11px] font-bold uppercase tracking-wide ${
+                                statusStyles[t.status] || "bg-stone-100 text-stone-800"
+                              }`}
+                            >
+                              {labelMap[t.status] || t.status}
+                            </span>
+                          );
+                        },
                       },
                     ]}
                     rows={filteredTenants}
                     emptyMessage={tenantSearch ? "No stores match your search." : "No store tenants registered yet."}
                     actions={(t) => (
                       <div className="flex items-center gap-2">
-                        <button
-                          type="button"
-                          onClick={() => handleInspectTenant(t)}
-                          className="rounded-lg bg-[#173c32]/10 dark:bg-white/10 px-2.5 py-1 text-xs font-semibold text-[#173c32] dark:text-white hover:bg-[#173c32]/20 touch-manipulation"
-                          title="View accounts under this tenant"
-                        >
-                          View Access
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => toggleTenantStatus(t)}
-                          className={`rounded-lg px-2.5 py-1 text-xs font-semibold transition touch-manipulation ${
-                            t.status === "active"
-                              ? "bg-amber-50 dark:bg-amber-950/40 text-amber-700 dark:text-amber-400 hover:bg-amber-100"
-                              : "bg-green-50 dark:bg-green-950/40 text-green-600 dark:text-green-400 hover:bg-green-100"
-                          }`}
-                        >
-                          {t.status === "active" ? "Suspend" : "Activate"}
-                        </button>
-                        {t.status === "suspended" && (
-                          <button
-                            type="button"
-                            onClick={() => {
-                              setDeleteTenantTarget(t);
-                              setDeleteTenantError("");
-                            }}
-                            className="rounded-lg bg-red-50 dark:bg-red-950/40 px-2.5 py-1 text-xs font-bold text-red-600 dark:text-red-400 hover:bg-red-100 dark:hover:bg-red-900/50 transition touch-manipulation"
-                            title="Remove suspended store tenant"
-                          >
-                            Remove
-                          </button>
+                        {t.status === "pending_approval" ? (
+                          <>
+                            <button
+                              type="button"
+                              onClick={() => handleReviewTenantPayment(t, "approve")}
+                              className="rounded-lg bg-emerald-600 px-2.5 py-1 text-xs font-bold text-white hover:bg-emerald-700 transition touch-manipulation shadow-sm"
+                            >
+                              ✓ Approve
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => handleReviewTenantPayment(t, "reject")}
+                              className="rounded-lg bg-red-100 dark:bg-red-950/60 px-2.5 py-1 text-xs font-bold text-red-700 dark:text-red-300 hover:bg-red-200 transition touch-manipulation"
+                            >
+                              ✕ Reject
+                            </button>
+                          </>
+                        ) : (
+                          <>
+                            <button
+                              type="button"
+                              onClick={() => handleInspectTenant(t)}
+                              className="rounded-lg bg-[#173c32]/10 dark:bg-white/10 px-2.5 py-1 text-xs font-semibold text-[#173c32] dark:text-white hover:bg-[#173c32]/20 touch-manipulation"
+                              title="View accounts under this tenant"
+                            >
+                              View Access
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => toggleTenantStatus(t)}
+                              className={`rounded-lg px-2.5 py-1 text-xs font-semibold transition touch-manipulation ${
+                                t.status === "active"
+                                  ? "bg-amber-50 dark:bg-amber-950/40 text-amber-700 dark:text-amber-400 hover:bg-amber-100"
+                                  : "bg-green-50 dark:bg-green-950/40 text-green-600 dark:text-green-400 hover:bg-green-100"
+                              }`}
+                            >
+                              {t.status === "active" ? "Suspend" : "Activate"}
+                            </button>
+                            {t.status === "suspended" && (
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setDeleteTenantTarget(t);
+                                  setDeleteTenantError("");
+                                }}
+                                className="rounded-lg bg-red-50 dark:bg-red-950/40 px-2.5 py-1 text-xs font-bold text-red-600 dark:text-red-400 hover:bg-red-100 dark:hover:bg-red-900/50 transition touch-manipulation"
+                                title="Remove suspended store tenant"
+                              >
+                                Remove
+                              </button>
+                            )}
+                          </>
                         )}
                       </div>
                     )}

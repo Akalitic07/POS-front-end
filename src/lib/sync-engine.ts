@@ -1,6 +1,6 @@
 import { replicateRxCollection } from 'rxdb/plugins/replication';
 import type { RxDatabase, WithDeleted } from 'rxdb';
-import { getConnectionStatus } from './connection-status';
+import { isAppSyncConfigured, graphqlRequest } from './appsync-client';
 
 const API_URL = typeof process !== 'undefined' && process.env?.NEXT_PUBLIC_API_URL || 'http://localhost:4000';
 
@@ -24,9 +24,50 @@ async function syncPull(collection: string, checkpoint: SyncCheckpoint | undefin
   const token = getAuthToken();
   if (!token) throw new Error('Not authenticated');
 
+  // 1. Cloud AppSync GraphQL Engine
+  if (isAppSyncConfigured()) {
+    const query = `
+      query SyncPull($collection: String!, $checkpoint: CheckpointInput, $limit: Int) {
+        syncPull(collection: $collection, checkpoint: $checkpoint, limit: $limit) {
+          documents
+          checkpoint {
+            id
+            updatedAt
+          }
+        }
+      }
+    `;
+
+    const data = await graphqlRequest<{
+      syncPull: {
+        documents: any[];
+        checkpoint: { id: string; updatedAt: string } | null;
+      };
+    }>(
+      query,
+      {
+        collection,
+        checkpoint: checkpoint ? { id: checkpoint.id, updatedAt: checkpoint.updatedAt } : null,
+        limit: batchSize,
+      },
+      token
+    );
+
+    const rawDocs = data.syncPull.documents || [];
+    const documents = rawDocs.map((doc: any) =>
+      typeof doc === 'string' ? JSON.parse(doc) : doc
+    );
+
+    return {
+      documents: documents as WithDeleted<any>[],
+      checkpoint: (data.syncPull.checkpoint || checkpoint || undefined) as SyncCheckpoint | undefined,
+    };
+  }
+
+  // 2. Local / Express REST Fallback
   const res = await fetch(`${API_URL}/api/sync/${collection}/pull`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
     body: JSON.stringify({ checkpoint: checkpoint || null, limit: batchSize }),
   });
 
@@ -42,9 +83,47 @@ async function syncPush(collection: string, changeRows: any[]) {
   const token = getAuthToken();
   if (!token) throw new Error('Not authenticated');
 
+  // 1. Cloud AppSync GraphQL Engine
+  if (isAppSyncConfigured()) {
+    const mutation = `
+      mutation SyncPush($collection: String!, $changeRows: [SyncChangeRowInput!]!) {
+        syncPush(collection: $collection, changeRows: $changeRows) {
+          conflicts
+        }
+      }
+    `;
+
+    const formattedRows = changeRows.map((row) => ({
+      newDocumentState:
+        typeof row.newDocumentState === 'string'
+          ? row.newDocumentState
+          : JSON.stringify(row.newDocumentState),
+      assumedMasterState: row.assumedMasterState
+        ? typeof row.assumedMasterState === 'string'
+          ? row.assumedMasterState
+          : JSON.stringify(row.assumedMasterState)
+        : null,
+    }));
+
+    const data = await graphqlRequest<{
+      syncPush: { conflicts: any[] };
+    }>(
+      mutation,
+      { collection, changeRows: formattedRows },
+      token
+    );
+
+    const rawConflicts = data.syncPush.conflicts || [];
+    const conflicts = rawConflicts.map((c: any) =>
+      typeof c === 'string' ? JSON.parse(c) : c
+    );
+    return conflicts as WithDeleted<any>[];
+  }
+
+  // 2. Local / Express REST Fallback
   const res = await fetch(`${API_URL}/api/sync/${collection}/push`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
     body: JSON.stringify({ changeRows }),
   });
 
@@ -74,7 +153,7 @@ export function startSync(db: RxDatabase, tenantId: string): void {
       },
       push: {
         handler: async (changeRows) => {
-          const apiRows = changeRows.map(row => ({
+          const apiRows = changeRows.map((row) => ({
             newDocumentState: row.newDocumentState,
             assumedMasterState: row.assumedMasterState || null,
           }));
@@ -108,7 +187,7 @@ export function stopSync(): void {
 }
 
 export function getSyncStatus(): { collection: string; active: boolean; error: string | null }[] {
-  return activeReplications.map(rep => ({
+  return activeReplications.map((rep) => ({
     collection: rep.collection.name,
     active: !rep.isStopped(),
     error: null,

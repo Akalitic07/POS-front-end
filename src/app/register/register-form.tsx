@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { FormEvent, useEffect, useState } from "react";
-import { postJson, type Role } from "@/lib/api";
+import { postJson, getJson, type Role } from "@/lib/api";
 import { useAuth } from "@/hooks/useAuth";
 import { ThemeToggle } from "@/components/ui/ThemeToggle";
 import { EmailOtpVerifier } from "@/components/ui/EmailOtpVerifier";
@@ -42,9 +42,8 @@ export default function RegisterForm() {
   useEffect(() => {
     async function loadTenants() {
       try {
-        const data = await fetch(`${process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:4000"}/api/tenants`);
-        const json = await data.json();
-        const list: Tenant[] = json.tenants ?? [];
+        const res = await getJson<any>("/api/tenants");
+        const list: Tenant[] = Array.isArray(res) ? res : res?.tenants ?? [];
         setTenants(list);
         if (list.length > 0) setTenantId(list[0].id);
       } catch {

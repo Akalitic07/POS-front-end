@@ -1,5 +1,7 @@
 import { getPosDatabase, type PosOutboxItem } from './pos-database';
 import { getConnectionStatus, onConnectionChange } from './connection-status';
+import { isAppSyncConfigured, graphqlRequest } from './appsync-client';
+import { getStoredSession } from './api';
 
 const API_URL = typeof process !== 'undefined' && process.env?.NEXT_PUBLIC_API_URL || 'http://localhost:4000';
 const OUTBOX_STORAGE_KEY = 'pointe-offline-outbox';
@@ -58,45 +60,56 @@ export async function queueOfflineAction(
     console.warn('[outbox] rxdb queue warning:', err);
   }
 
-  console.log(`[outbox] Queued offline action: ${actionType} (ID: ${item.id})`);
+  // 3. Dispatch an event for reactive UI badge updates
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('pointe-outbox-changed', { detail: { count: current.length } }));
+  }
+
   return item;
 }
 
-// Get count of pending actions waiting to sync
+// Get the count of pending outbox items for UI sync badges
 export function getPendingOutboxCount(tenantId?: string): number {
   const items = getLocalOutbox();
   if (!tenantId) return items.length;
   return items.filter(i => i.tenantId === tenantId).length;
 }
 
-// Get IDs of items currently queued in the outbox to protect them during reconciliation
-export function getPendingOutboxIds(tenantId?: string): { productIds: Set<string>; inventoryIds: Set<string> } {
+// Get Sets of pending IDs in outbox to overlay onto UI
+export function getPendingOutboxIds(tenantId?: string): {
+  productIds: Set<string>;
+  inventoryIds: Set<string>;
+  transactionIds: Set<string>;
+} {
   const items = getLocalOutbox();
   const filtered = tenantId ? items.filter(i => i.tenantId === tenantId) : items;
   const productIds = new Set<string>();
   const inventoryIds = new Set<string>();
+  const transactionIds = new Set<string>();
 
   for (const item of filtered) {
-    if (item.actionType === 'create_product' && item.payload) {
-      if (item.payload.product?.id) productIds.add(String(item.payload.product.id));
-      if (item.payload.inventory?.id) inventoryIds.add(String(item.payload.inventory.id));
-      if (item.payload.inventory?.productId) {
-        inventoryIds.add(String(item.payload.inventory.productId));
-        productIds.add(String(item.payload.inventory.productId));
-      }
+    if (item.actionType === 'create_product') {
+      if (item.payload?.product?.id) productIds.add(String(item.payload.product.id));
+      if (item.payload?.inventory?.id) inventoryIds.add(String(item.payload.inventory.id));
+      if (item.payload?.inventory?.productId) inventoryIds.add(String(item.payload.inventory.productId));
+    } else if (item.actionType === 'create_transaction') {
+      if (item.payload?.id) transactionIds.add(String(item.payload.id));
+    } else if (item.actionType === 'return_transaction') {
+      if (item.payload?.transactionId) transactionIds.add(String(item.payload.transactionId));
     }
   }
 
-  return { productIds, inventoryIds };
+  return { productIds, inventoryIds, transactionIds };
 }
 
-// Calculate pending net stock adjustments for all items currently queued in outbox
-export function getPendingOutboxStockDeltas(tenantId?: string): {
+// Calculate the net offline delta for each product from pending outbox items
+export function getPendingStockDeltas(tenantId: string): {
   byProductId: Record<string, number>;
   byProductName: Record<string, number>;
 } {
   const items = getLocalOutbox();
-  const filtered = tenantId ? items.filter(i => i.tenantId === tenantId) : items;
+  const filtered = items.filter(i => i.tenantId === tenantId);
+
   const byProductId: Record<string, number> = {};
   const byProductName: Record<string, number> = {};
 
@@ -143,9 +156,11 @@ export function getPendingOutboxStockDeltas(tenantId?: string): {
   return { byProductId, byProductName };
 }
 
+export const getPendingOutboxStockDeltas = getPendingStockDeltas;
+
 let isFlushing = false;
 
-// Flush and sync all queued outbox actions to the backend API
+// Flush and sync all queued outbox actions to the backend API (Cloud AppSync or Local REST)
 export async function flushOutbox(token: string): Promise<{ success: number; failed: number }> {
   if (!token || isFlushing || !getConnectionStatus()) {
     return { success: 0, failed: 0 };
@@ -166,48 +181,97 @@ export async function flushOutbox(token: string): Promise<{ success: number; fai
     try {
       if (item.actionType === 'create_product') {
         const { product, inventory } = item.payload;
-        if (product) {
-          const res = await fetch(`${API_URL}/api/products`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-            body: JSON.stringify(product),
-          });
-          if (!res.ok && res.status !== 409) {
-            const errData = await res.json().catch(() => ({}));
-            throw new Error(errData.message || `Product sync failed (${res.status})`);
+
+        if (isAppSyncConfigured()) {
+          if (product) {
+            await graphqlRequest(
+              `mutation OutboxCreateProduct($input: CreateProductInput!) {
+                createProduct(input: $input) { id }
+              }`,
+              { input: product },
+              token
+            );
           }
-        }
-        if (inventory) {
-          const res = await fetch(`${API_URL}/api/inventory`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-            body: JSON.stringify(inventory),
-          });
-          if (!res.ok && res.status !== 409) {
-            const errData = await res.json().catch(() => ({}));
-            throw new Error(errData.message || `Inventory sync failed (${res.status})`);
+          if (inventory) {
+            await graphqlRequest(
+              `mutation OutboxCreateInventory($productId: String!, $productName: String, $stockQty: Float!, $lowStockThreshold: Float, $unit: String, $mode: String) {
+                createInventoryItem(productId: $productId, productName: $productName, stockQty: $stockQty, lowStockThreshold: $lowStockThreshold, unit: $unit, mode: $mode) { id }
+              }`,
+              inventory,
+              token
+            );
+          }
+        } else {
+          if (product) {
+            const res = await fetch(`${API_URL}/api/products`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+              body: JSON.stringify(product),
+            });
+            if (!res.ok && res.status !== 409) {
+              const errData = await res.json().catch(() => ({}));
+              throw new Error(errData.message || `Product sync failed (${res.status})`);
+            }
+          }
+          if (inventory) {
+            const res = await fetch(`${API_URL}/api/inventory`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+              body: JSON.stringify(inventory),
+            });
+            if (!res.ok && res.status !== 409) {
+              const errData = await res.json().catch(() => ({}));
+              throw new Error(errData.message || `Inventory sync failed (${res.status})`);
+            }
           }
         }
       } else if (item.actionType === 'create_transaction') {
-        const res = await fetch(`${API_URL}/api/transactions`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-          body: JSON.stringify(item.payload),
-        });
-        if (!res.ok) {
-          const errData = await res.json().catch(() => ({}));
-          // If already exists on server, treat as success
-          if (res.status !== 409 && !errData.message?.includes('already exists')) {
-            throw new Error(errData.message || `Transaction sync failed (${res.status})`);
+        if (isAppSyncConfigured()) {
+          try {
+            await graphqlRequest(
+              `mutation OutboxCreateTransaction($input: CreateTransactionInput!) {
+                createTransaction(input: $input) { id }
+              }`,
+              { input: item.payload },
+              token
+            );
+          } catch (gqlErr: any) {
+            const msg = gqlErr?.message || '';
+            // If the transaction was already created by another node or previous partial flush, treat as success
+            if (!msg.includes('already exists') && !msg.includes('ConditionalCheckFailed')) {
+              throw gqlErr;
+            }
+          }
+        } else {
+          const res = await fetch(`${API_URL}/api/transactions`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+            body: JSON.stringify(item.payload),
+          });
+          if (!res.ok) {
+            const errData = await res.json().catch(() => ({}));
+            if (res.status !== 409 && !errData.message?.includes('already exists')) {
+              throw new Error(errData.message || `Transaction sync failed (${res.status})`);
+            }
           }
         }
       } else if (item.actionType === 'return_transaction') {
         const { transactionId, items: returnItems, returnReason } = item.payload;
-        await fetch(`${API_URL}/api/transactions/${transactionId}/return`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-          body: JSON.stringify({ items: returnItems, returnReason }),
-        });
+        if (isAppSyncConfigured()) {
+          await graphqlRequest(
+            `mutation OutboxProcessReturn($input: ProcessReturnInput!) {
+              processReturn(input: $input) { success }
+            }`,
+            { input: { transactionId, items: returnItems, returnReason } },
+            token
+          );
+        } else {
+          await fetch(`${API_URL}/api/transactions/${transactionId}/return`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+            body: JSON.stringify({ items: returnItems, returnReason }),
+          });
+        }
       }
 
       // Action completed successfully
@@ -227,62 +291,34 @@ export async function flushOutbox(token: string): Promise<{ success: number; fai
       failedCount++;
       item.retryCount = (item.retryCount || 0) + 1;
       remainingItems.push(item);
-      // If network failure, stop further processing in this run
-      if (!getConnectionStatus()) break;
+      break; // Pause remaining flushes until network stabilizes
     }
   }
 
+  // Update outbox storage with items that failed and need subsequent retry
   saveLocalOutbox(remainingItems);
-  isFlushing = false;
 
-  if (successCount > 0) {
-    console.log(`[outbox] Successfully flushed ${successCount} queued action(s) to DynamoDB.`);
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('pointe-outbox-changed', { detail: { count: remainingItems.length } }));
   }
+
+  isFlushing = false;
   return { success: successCount, failed: failedCount };
 }
 
-// Global auto-sync watcher
-let autoSyncStarted = false;
-let autoSyncInterval: ReturnType<typeof setInterval> | null = null;
-
-export function startOutboxAutoSync(): void {
-  if (typeof window === 'undefined' || autoSyncStarted) return;
-  autoSyncStarted = true;
-
-  const getSessionToken = () => {
-    try {
-      const raw = localStorage.getItem('pointe-session');
-      return raw ? JSON.parse(raw).token : null;
-    } catch {
-      return null;
-    }
-  };
-
-  // 1. Listen for connection restoration
-  onConnectionChange((online) => {
+// Auto-flush listener: initiates drain whenever connection transitions from offline to online
+export function startOutboxAutoSync(getToken?: () => string | null): () => void {
+  const unsubscribe = onConnectionChange((online) => {
     if (online) {
-      const token = getSessionToken();
+      const token = getToken ? getToken() : (getStoredSession()?.token || null);
       if (token) {
-        flushOutbox(token).catch(() => {});
+        console.log('[outbox] Cloud connection detected, draining offline queue...');
+        void flushOutbox(token);
       }
     }
   });
 
-  // 2. Periodic background drain if online
-  if (autoSyncInterval) clearInterval(autoSyncInterval);
-  autoSyncInterval = setInterval(() => {
-    if (getConnectionStatus()) {
-      const token = getSessionToken();
-      if (token && getPendingOutboxCount() > 0) {
-        flushOutbox(token).catch(() => {});
-      }
-    }
-  }, 10000);
-
-  // Initial attempt
-  const token = getSessionToken();
-  if (token && getConnectionStatus()) {
-    flushOutbox(token).catch(() => {});
-  }
+  return unsubscribe;
 }
 
+export const startOutboxAutoFlush = startOutboxAutoSync;

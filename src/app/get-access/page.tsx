@@ -2,118 +2,140 @@
 
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { FormEvent, useState } from "react";
-import { postJson } from "@/lib/api";
+import { FormEvent, useState, useEffect, useRef } from "react";
+import { postJson, getJson, saveSession } from "@/lib/api";
 import { ThemeToggle } from "@/components/ui/ThemeToggle";
 import { EmailOtpVerifier } from "@/components/ui/EmailOtpVerifier";
 
-// Luhn algorithm validator for credit cards
-function isValidLuhn(digits: string): boolean {
-  let sum = 0;
-  let shouldDouble = false;
-  for (let i = digits.length - 1; i >= 0; i--) {
-    let digit = parseInt(digits.charAt(i), 10);
-    if (isNaN(digit)) return false;
-    if (shouldDouble) {
-      digit *= 2;
-      if (digit > 9) digit -= 9;
-    }
-    sum += digit;
-    shouldDouble = !shouldDouble;
-  }
-  return sum % 10 === 0;
-}
+type WizardStep = "register" | "payment" | "waiting" | "active" | "rejected";
 
 export default function GetAccessPage() {
   const router = useRouter();
 
-  // Wizard steps: 1 = Store Details, 2 = Payment, 3 = Credentials, 4 = Success
-  const [step, setStep] = useState<1 | 2 | 3 | 4>(1);
+  // Wizard state
+  const [step, setStep] = useState<WizardStep>("register");
 
-  // Step 1: Store & Contact
-  const [storeName, setStoreName] = useState("");
-  const [email, setEmail]         = useState("");
-  const [otpVerified, setOtpVerified] = useState(false);
+  // Step 1: Store & Owner Registration
+  const [storeName, setStoreName]                 = useState("");
+  const [ownerName, setOwnerName]                 = useState("");
+  const [email, setEmail]                         = useState("");
+  const [password, setPassword]                   = useState("");
+  const [confirmPass, setConfirmPass]             = useState("");
+  const [otpVerified, setOtpVerified]             = useState(false);
   const [verificationToken, setVerificationToken] = useState("");
+  const [registering, setRegistering]             = useState(false);
 
-  // Step 2: Payment Details (Zero-fee reliable test card gateway)
-  const [cardName, setCardName]     = useState("");
-  const [cardNumber, setCardNumber] = useState("");
-  const [cardExpiry, setCardExpiry] = useState("");
-  const [cardCvc, setCardCvc]       = useState("");
-  const [isProcessingPayment, setIsProcessingPayment] = useState(false);
-  const [paymentDone, setPaymentDone] = useState(false);
+  // Authenticated tenant / session info
+  const [tenantId, setTenantId]     = useState<string | null>(null);
+  const [authToken, setAuthToken]   = useState<string | null>(null);
+  const [tenantStatus, setTenantStatus] = useState<string>("pending_payment");
+  const [rejectionReason, setRejectionReason] = useState<string | null>(null);
 
-  // Step 3: Owner Credentials
-  const [ownerName, setOwnerName]     = useState("");
-  const [password, setPassword]       = useState("");
-  const [confirmPass, setConfirmPass] = useState("");
-  const [submitting, setSubmitting]   = useState(false);
+  // Step 2: NayaPay Payment Details
+  const NAYAPAY_ACCOUNT = "03217253923";
+  const NAYAPAY_TITLE   = "Pointe POS (NayaPay)";
+  const [senderName, setSenderName] = useState("");
+  const [submittingPayment, setSubmittingPayment] = useState(false);
+  const [paymentSubmittedOnce, setPaymentSubmittedOnce] = useState(false);
+  const [copiedAccount, setCopiedAccount] = useState(false);
 
-  // General error handling
+  // General error & notice handling
   const [error, setError] = useState("");
+  const [successNotice, setSuccessNotice] = useState("");
 
-  // Quick fill test card
-  const handleFillTestCard = () => {
-    setCardName(ownerName || "Jane Storeowner");
-    setCardNumber("4242 4242 4242 4242");
-    setCardExpiry("12/28");
-    setCardCvc("123");
-    setError("");
+  // Polling interval ref for waiting state
+  const pollTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // Check if user is already logged in as SubAdmin
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem("pointe-session");
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (parsed.token && parsed.user?.role === "SubAdmin") {
+          setAuthToken(parsed.token);
+          if (parsed.user.tenantId) setTenantId(parsed.user.tenantId);
+          // Check live status
+          checkTenantStatus(parsed.token);
+        }
+      }
+    } catch {}
+  }, []);
+
+  // Poll status function
+  const checkTenantStatus = async (token: string) => {
+    try {
+      const res = await getJson<{ tenant: any }>("/api/tenants/my-status", token);
+      if (res?.tenant) {
+        setTenantStatus(res.tenant.status);
+        if (res.tenant.paymentSenderName) {
+          setSenderName(res.tenant.paymentSenderName);
+        }
+        if (res.tenant.rejectionReason) {
+          setRejectionReason(res.tenant.rejectionReason);
+        }
+
+        if (res.tenant.status === "active") {
+          setStep("active");
+          if (pollTimerRef.current) clearInterval(pollTimerRef.current);
+          setTimeout(() => {
+            router.push("/dashboard/subadmin");
+          }, 1500);
+        } else if (res.tenant.status === "pending_approval") {
+          setStep("waiting");
+          setPaymentSubmittedOnce(true);
+        } else if (res.tenant.status === "rejected") {
+          setStep("rejected");
+          setPaymentSubmittedOnce(false); // Re-activate button on rejection
+          if (pollTimerRef.current) clearInterval(pollTimerRef.current);
+        } else {
+          setStep("payment");
+        }
+      }
+    } catch (err) {
+      console.warn("[status check error]:", err);
+    }
   };
 
-  // Step 1 submit: Move to payment
-  const handleStoreDetailsSubmit = (e: FormEvent) => {
-    e.preventDefault();
-    if (!storeName.trim() || !email.trim()) {
-      setError("Please provide your store name and business email.");
-      return;
+  // Start polling while in waiting state
+  useEffect(() => {
+    if (step === "waiting" && authToken) {
+      if (pollTimerRef.current) clearInterval(pollTimerRef.current);
+      pollTimerRef.current = setInterval(() => {
+        checkTenantStatus(authToken);
+      }, 4000);
+    } else {
+      if (pollTimerRef.current) {
+        clearInterval(pollTimerRef.current);
+        pollTimerRef.current = null;
+      }
     }
-    if (!otpVerified) {
-      setError("Please verify your business email with the OTP code before proceeding.");
-      return;
-    }
-    setError("");
-    setStep(2);
+
+    return () => {
+      if (pollTimerRef.current) clearInterval(pollTimerRef.current);
+    };
+  }, [step, authToken]);
+
+  // Copy NayaPay Account Number
+  const handleCopyAccount = () => {
+    navigator.clipboard.writeText(NAYAPAY_ACCOUNT);
+    setCopiedAccount(true);
+    setTimeout(() => setCopiedAccount(false), 2000);
   };
 
-  // Step 2 submit: Process zero-fee card payment verification
-  const handlePaymentSubmit = async (e: FormEvent) => {
+  // ── Step 1: Submit Store Registration ───────────────────────────────────────
+  const handleRegisterStore = async (e: FormEvent) => {
     e.preventDefault();
     setError("");
+    setSuccessNotice("");
 
-    const cleanCard = cardNumber.replace(/\s+/g, "");
-    if (cleanCard.length < 13 || cleanCard.length > 19 || !isValidLuhn(cleanCard)) {
-      setError("Please enter a valid credit card number (or click 'Fill Test Card').");
+    if (!storeName.trim() || !ownerName.trim() || !email.trim()) {
+      setError("Please fill in all store and owner details.");
       return;
     }
 
-    if (!/^(0[1-9]|1[0-2])\/?([0-9]{2})$/.test(cardExpiry.trim())) {
-      setError("Please enter a valid expiry date in MM/YY format.");
-      return;
-    }
-
-    if (!/^[0-9]{3,4}$/.test(cardCvc.trim())) {
-      setError("Please enter a valid 3 or 4 digit CVC.");
-      return;
-    }
-
-    setIsProcessingPayment(true);
-    // Simulate secure 256-bit gateway verification with reliable zero-fee simulation
-    setTimeout(() => {
-      setIsProcessingPayment(false);
-      setPaymentDone(true);
-      setStep(3);
-    }, 1200);
-  };
-
-  // Step 3 submit: Create Tenant + SubAdmin account
-  const handleAccountCreation = async (e: FormEvent) => {
-    e.preventDefault();
-    setError("");
-
-    if (!ownerName.trim()) {
-      setError("Please enter your full name or admin username.");
+    if (!otpVerified || !verificationToken) {
+      setError("Please verify your email address with the 6-digit OTP code before continuing.");
       return;
     }
 
@@ -127,28 +149,80 @@ export default function GetAccessPage() {
       return;
     }
 
-    setSubmitting(true);
+    setRegistering(true);
     try {
-      await postJson("/api/auth/onboard-store", {
+      // 1. Onboard store and create SubAdmin
+      const data = await postJson<{
+        message: string;
+        tenant: { id: string; name: string; slug: string };
+        user: any;
+      }>("/api/auth/onboard-store", {
         storeName: storeName.trim(),
-        email: email.trim(),
         name: ownerName.trim(),
+        email: email.trim().toLowerCase(),
         password,
         verificationToken,
       });
 
-      setStep(4);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to initialize store and account.");
+      // 2. Automatically log in to obtain JWT for payment verification
+      const loginRes = await postJson<{ token: string; user: any }>("/api/auth/login", {
+        email: email.trim().toLowerCase(),
+        password,
+      });
+
+      saveSession(loginRes.token, loginRes.user);
+      setAuthToken(loginRes.token);
+      setTenantId(data.tenant.id);
+      setTenantStatus("pending_payment");
+      setStep("payment");
+      setSuccessNotice("Store profile created! Please complete payment verification below.");
+    } catch (err: any) {
+      setError(err?.message || "Registration failed. Please check your information.");
     } finally {
-      setSubmitting(false);
+      setRegistering(false);
+    }
+  };
+
+  // ── Step 2: Submit NayaPay Payment Verification ─────────────────────────────
+  const handleSubmitPaymentVerification = async (e: FormEvent) => {
+    e.preventDefault();
+    setError("");
+    setSuccessNotice("");
+
+    if (!senderName.trim()) {
+      setError("Sender Account Holder Name is mandatory (jo account mn payment send kr ga).");
+      return;
+    }
+
+    if (!authToken) {
+      setError("Session expired. Please log in again to verify payment.");
+      return;
+    }
+
+    setSubmittingPayment(true);
+    try {
+      const res = await postJson<{ message: string; tenant: any }>(
+        "/api/tenants/payment-verification",
+        { senderName: senderName.trim() },
+        authToken
+      );
+
+      // Disable button immediately after single press
+      setPaymentSubmittedOnce(true);
+      setTenantStatus("pending_approval");
+      setStep("waiting");
+      setSuccessNotice("Verification request sent to Admin! Waiting for approval.");
+    } catch (err: any) {
+      setError(err?.message || "Failed to submit payment verification.");
+    } finally {
+      setSubmittingPayment(false);
     }
   };
 
   return (
     <main className="min-h-screen bg-[#f6f1ea] dark:bg-[#0d1512] text-[#1f2a25] dark:text-[#f6f1ea] transition-colors duration-200 px-4 py-8 md:py-12">
       <div className="mx-auto max-w-2xl">
-        {/* Header bar */}
+        {/* Top Header */}
         <div className="mb-6 sm:mb-8 flex items-center justify-between gap-3">
           <div className="flex items-center gap-2.5 sm:gap-3 min-w-0">
             <Link
@@ -158,102 +232,123 @@ export default function GetAccessPage() {
               P
             </Link>
             <div className="min-w-0">
-              <div className="text-lg sm:text-xl font-bold tracking-tight text-[#173c32] dark:text-[#f6f1ea] truncate">Pointe POS</div>
-              <div className="text-[10px] sm:text-xs uppercase tracking-[0.2em] text-[#a26d2d] dark:text-[#edd3ab] truncate">
-                Store Onboarding Portal
-              </div>
+              <span className="block text-xs font-bold uppercase tracking-wider text-[#a26d2d] dark:text-[#d7a35d]">
+                Pointe POS
+              </span>
+              <h1 className="text-xl sm:text-2xl font-black tracking-tight text-[#173c32] dark:text-white truncate">
+                Store Onboarding & Activation
+              </h1>
             </div>
           </div>
-          <div className="flex items-center gap-2 sm:gap-3 shrink-0">
-            <ThemeToggle />
-            <Link
-              href="/login"
-              className="min-h-[38px] inline-flex items-center rounded-xl border border-[#d9d0c3] dark:border-white/20 px-3 sm:px-3.5 py-1.5 text-xs font-semibold hover:bg-black/5 dark:hover:bg-white/10"
-            >
-              Sign in
-            </Link>
+          <ThemeToggle />
+        </div>
+
+        {/* Global Feedback Banner */}
+        {error && (
+          <div className="mb-6 rounded-2xl border border-red-300 dark:border-red-900 bg-red-50 dark:bg-red-950/40 p-4 text-xs font-bold text-red-700 dark:text-red-300 shadow-sm flex items-center justify-between">
+            <span>⚠️ {error}</span>
+            <button type="button" onClick={() => setError("")} className="px-2 font-bold hover:opacity-75">✕</button>
+          </div>
+        )}
+
+        {successNotice && (
+          <div className="mb-6 rounded-2xl border border-emerald-300 dark:border-emerald-800 bg-emerald-50 dark:bg-emerald-950/40 p-4 text-xs font-bold text-emerald-800 dark:text-emerald-300 shadow-sm">
+            ✓ {successNotice}
+          </div>
+        )}
+
+        {/* Step Indicator */}
+        <div className="mb-8 flex items-center justify-center gap-3 text-xs font-bold">
+          <div
+            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full transition-all ${
+              step === "register"
+                ? "bg-[#173c32] text-white dark:bg-[#d7a35d] dark:text-[#173c32]"
+                : "bg-[#e8e2d8] text-[#5d665f] dark:bg-white/10 dark:text-white/60"
+            }`}
+          >
+            <span>1</span>
+            <span>Store Registration</span>
+          </div>
+
+          <span className="text-[#a26d2d]">→</span>
+
+          <div
+            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full transition-all ${
+              step !== "register"
+                ? "bg-[#173c32] text-white dark:bg-[#d7a35d] dark:text-[#173c32]"
+                : "bg-[#e8e2d8] text-[#5d665f] dark:bg-white/10 dark:text-white/60"
+            }`}
+          >
+            <span>2</span>
+            <span>NayaPay Verification & Approval</span>
           </div>
         </div>
 
-        {/* Wizard progress tracker */}
-        <div className="mb-8 rounded-2xl bg-white dark:bg-[#14211c] p-4 shadow-sm border border-[#ece4da] dark:border-white/10">
-          <div className="grid grid-cols-3 gap-2 text-center text-xs font-bold">
-            <div className={`py-2 rounded-xl transition ${step >= 1 ? "bg-[#173c32] text-white" : "text-[#5d665f]"}`}>
-              1. Store Details
-            </div>
-            <div className={`py-2 rounded-xl transition ${step >= 2 ? "bg-[#173c32] text-white" : "text-[#5d665f]"}`}>
-              2. Payment (Rs. 0 Free Trial)
-            </div>
-            <div className={`py-2 rounded-xl transition ${step >= 3 ? "bg-[#173c32] text-white" : "text-[#5d665f]"}`}>
-              3. Account Setup
-            </div>
-          </div>
-        </div>
+        {/* ═════════════════════════════════════════════════════════════════════ */}
+        {/* STEP 1: STORE & SUBADMIN REGISTRATION */}
+        {/* ═════════════════════════════════════════════════════════════════════ */}
+        {step === "register" && (
+          <div className="rounded-3xl border border-[#ece4da] dark:border-white/10 bg-white dark:bg-white/[0.03] p-6 sm:p-8 shadow-sm">
+            <h2 className="text-lg font-black text-[#173c32] dark:text-white mb-1">
+              Create Your Store Profile
+            </h2>
+            <p className="text-xs text-[#5d665f] dark:text-[#a0ada5] mb-6">
+              Register your store and SubAdmin credentials. Real email verification is required.
+            </p>
 
-        {/* Card Container */}
-        <div className="rounded-[2rem] bg-white dark:bg-[#14211c] p-7 md:p-10 shadow-xl shadow-[#173c32]/5 border border-[#ece4da] dark:border-white/10">
-          {error && (
-            <div className="mb-6 rounded-xl border border-red-200 bg-red-50 dark:bg-red-950/40 dark:border-red-800 p-4 text-sm text-red-700 dark:text-red-300">
-              {error}
-            </div>
-          )}
-
-          {/* ──────────────── STEP 1: STORE & CONTACT ──────────────── */}
-          {step === 1 && (
-            <div>
-              <div className="mb-6">
-                <span className="text-xs font-bold uppercase tracking-[0.22em] text-[#a26d2d]">Get Pointe POS</span>
-                <h1 className="mt-1 text-3xl font-black text-[#173c32] dark:text-[#f6f1ea]">
-                  Set up your store
-                </h1>
-                <p className="mt-2 text-sm text-[#5d665f] dark:text-[#a0ada5]">
-                  Start managing your counter sales, inventory, and staff with our offline-first POS platform.
-                </p>
+            <form onSubmit={handleRegisterStore} className="space-y-4">
+              <div>
+                <label className="block text-xs font-bold text-[#173c32] dark:text-white mb-1">
+                  Store / Business Name *
+                </label>
+                <input
+                  type="text"
+                  required
+                  value={storeName}
+                  onChange={(e) => setStoreName(e.target.value)}
+                  placeholder="e.g. Urban Roasters, City Supermarket"
+                  className="w-full rounded-xl border border-[#ece4da] dark:border-white/10 bg-[#faf8f4] dark:bg-black/20 p-3 text-sm text-[#173c32] dark:text-white placeholder-[#8a948c] focus:outline-none focus:ring-2 focus:ring-[#173c32]"
+                />
               </div>
 
-              <form onSubmit={handleStoreDetailsSubmit} className="space-y-5">
-                <label className="block text-sm font-semibold">
-                  Store / Business Name
-                  <input
-                    required
-                    type="text"
-                    value={storeName}
-                    onChange={(e) => setStoreName(e.target.value)}
-                    className="field"
-                    placeholder="e.g. Apex Coffee & Roastery"
-                  />
-                  <span className="mt-1 block text-xs text-[#5d665f] dark:text-[#a0ada5]">
-                    This will create your dedicated store tenant.
-                  </span>
+              <div>
+                <label className="block text-xs font-bold text-[#173c32] dark:text-white mb-1">
+                  SubAdmin Owner Full Name *
                 </label>
+                <input
+                  type="text"
+                  required
+                  value={ownerName}
+                  onChange={(e) => setOwnerName(e.target.value)}
+                  placeholder="e.g. Muhammad Tauseef"
+                  className="w-full rounded-xl border border-[#ece4da] dark:border-white/10 bg-[#faf8f4] dark:bg-black/20 p-3 text-sm text-[#173c32] dark:text-white placeholder-[#8a948c] focus:outline-none focus:ring-2 focus:ring-[#173c32]"
+                />
+              </div>
 
-                <label className="block text-sm font-semibold">
-                  Owner Business Email
-                  <input
-                    required
-                    type="email"
-                    value={email}
-                    onChange={(e) => {
-                      setEmail(e.target.value);
-                      setOtpVerified(false);
-                      setVerificationToken("");
-                    }}
-                    className="field"
-                    placeholder="owner@apexcoffee.com"
-                  />
-                  <span className="mt-1 block text-xs text-[#5d665f] dark:text-[#a0ada5]">
-                    Your primary login and system notifications address.
-                  </span>
+              <div>
+                <label className="block text-xs font-bold text-[#173c32] dark:text-white mb-1">
+                  Business Email Address *
                 </label>
+                <input
+                  type="email"
+                  required
+                  disabled={otpVerified}
+                  value={email}
+                  onChange={(e) => setEmail(e.target.value)}
+                  placeholder="owner@yourstore.com"
+                  className="w-full rounded-xl border border-[#ece4da] dark:border-white/10 bg-[#faf8f4] dark:bg-black/20 p-3 text-sm text-[#173c32] dark:text-white placeholder-[#8a948c] focus:outline-none focus:ring-2 focus:ring-[#173c32] disabled:opacity-60"
+                />
+              </div>
 
-                {/* OTP Verification for Store Owner */}
+              {/* Email OTP Verifier Component */}
+              <div className="pt-1">
                 <EmailOtpVerifier
                   email={email}
                   purpose="subadmin_register"
                   isVerified={otpVerified}
-                  onVerified={(tok) => {
+                  onVerified={(token) => {
                     setOtpVerified(true);
-                    setVerificationToken(tok);
+                    setVerificationToken(token);
                     setError("");
                   }}
                   onResetVerification={() => {
@@ -261,275 +356,218 @@ export default function GetAccessPage() {
                     setVerificationToken("");
                   }}
                 />
+              </div>
 
-                <div className="rounded-2xl bg-[#fff7eb] dark:bg-white/5 p-4 text-sm text-[#5e4829] dark:text-[#edd3ab]">
-                  ✨ Includes 1 SubAdmin (Store Manager), 1 dedicated HR seat, and unlimited Operator counter registers.
-                </div>
-
-                <button
-                  type="submit"
-                  className="w-full rounded-2xl bg-[#173c32] px-4 py-3.5 text-base font-bold text-white transition hover:bg-[#0f2d2b]"
-                >
-                  Continue to Payment Verification →
-                </button>
-              </form>
-            </div>
-          )}
-
-          {/* ──────────────── STEP 2: PAYMENT VERIFICATION ──────────────── */}
-          {step === 2 && (
-            <div>
-              <div className="mb-6 flex items-start justify-between gap-4">
+              <div className="grid sm:grid-cols-2 gap-3 pt-2">
                 <div>
-                  <span className="text-xs font-bold uppercase tracking-[0.22em] text-[#a26d2d]">Zero-Cost Activation</span>
-                  <h1 className="mt-1 text-2xl font-black text-[#173c32] dark:text-[#f6f1ea]">
-                    Card Payment System
-                  </h1>
-                  <p className="mt-1 text-sm text-[#5d665f] dark:text-[#a0ada5]">
-                    Store: <strong className="text-[#173c32] dark:text-white">{storeName}</strong> ({email})
-                  </p>
-                </div>
-                <div className="rounded-xl bg-green-100 dark:bg-green-950/60 px-3 py-1 text-xs font-bold text-green-800 dark:text-green-300">
-                  Rs. 0.00 / Free Activation
-                </div>
-              </div>
-
-              <div className="mb-5 flex items-center justify-between rounded-2xl border border-dashed border-[#d7a35d] bg-[#fffaf1] dark:bg-white/5 p-3.5 text-xs text-[#5d665f] dark:text-[#edd3ab]">
-                <div>
-                  <span>Need quick test card info? </span>
-                  <button
-                    type="button"
-                    onClick={handleFillTestCard}
-                    className="font-bold text-[#173c32] dark:text-[#d7a35d] underline"
-                  >
-                    Click to auto-fill free test card
-                  </button>
-                </div>
-                <span className="text-xs font-mono bg-white dark:bg-black/30 px-2 py-0.5 rounded border border-[#d9d0c3] dark:border-white/10">
-                  4242 •••• 4242
-                </span>
-              </div>
-
-              <form onSubmit={handlePaymentSubmit} className="space-y-4">
-                <label className="block text-sm font-semibold">
-                  Cardholder Name
-                  <input
-                    required
-                    type="text"
-                    value={cardName}
-                    onChange={(e) => setCardName(e.target.value)}
-                    className="field"
-                    placeholder="Full name as printed on card"
-                  />
-                </label>
-
-                <label className="block text-sm font-semibold">
-                  Card Number
-                  <div className="relative">
-                    <input
-                      required
-                      type="text"
-                      maxLength={19}
-                      value={cardNumber}
-                      onChange={(e) => {
-                        // Format with spaces every 4 digits
-                        const v = e.target.value.replace(/\D/g, "").slice(0, 16);
-                        setCardNumber(v.replace(/(\d{4})/g, "$1 ").trim());
-                      }}
-                      className="field font-mono"
-                      placeholder="4242 4242 4242 4242"
-                    />
-                    <span className="absolute right-3 top-3.5 text-xs font-bold text-[#5d665f] dark:text-white/60">
-                      💳 VISA / MC
-                    </span>
-                  </div>
-                </label>
-
-                <div className="grid grid-cols-2 gap-4">
-                  <label className="block text-sm font-semibold">
-                    Expiry Date
-                    <input
-                      required
-                      type="text"
-                      maxLength={5}
-                      value={cardExpiry}
-                      onChange={(e) => {
-                        let v = e.target.value.replace(/\D/g, "").slice(0, 4);
-                        if (v.length >= 3) v = `${v.slice(0, 2)}/${v.slice(2)}`;
-                        setCardExpiry(v);
-                      }}
-                      className="field font-mono"
-                      placeholder="MM/YY"
-                    />
+                  <label className="block text-xs font-bold text-[#173c32] dark:text-white mb-1">
+                    Password (Min. 8 chars) *
                   </label>
-
-                  <label className="block text-sm font-semibold">
-                    CVC / CVV
-                    <input
-                      required
-                      type="password"
-                      maxLength={4}
-                      value={cardCvc}
-                      onChange={(e) => setCardCvc(e.target.value.replace(/\D/g, "").slice(0, 4))}
-                      className="field font-mono"
-                      placeholder="123"
-                    />
-                  </label>
-                </div>
-
-                <div className="flex items-center gap-2 pt-2 text-xs text-[#5d665f] dark:text-[#a0ada5]">
-                  <span>🔒 256-bit SSL encrypted. Free reliable transaction verification. Zero fee charge.</span>
-                </div>
-
-                <div className="flex gap-3 pt-2">
-                  <button
-                    type="button"
-                    onClick={() => setStep(1)}
-                    className="rounded-2xl border border-[#d9d0c3] dark:border-white/20 px-4 py-3 text-sm font-semibold"
-                  >
-                    ← Back
-                  </button>
-                  <button
-                    type="submit"
-                    disabled={isProcessingPayment}
-                    className="flex-1 rounded-2xl bg-[#d7a35d] px-4 py-3.5 text-base font-bold text-[#173c32] transition hover:bg-[#c98d41] disabled:opacity-60"
-                  >
-                    {isProcessingPayment ? "Verifying with gateway…" : "Complete Free Payment & Verify ($0.00)"}
-                  </button>
-                </div>
-              </form>
-            </div>
-          )}
-
-          {/* ──────────────── STEP 3: OWNER CREDENTIALS ──────────────── */}
-          {step === 3 && (
-            <div>
-              <div className="mb-5 rounded-2xl bg-green-50 dark:bg-green-950/40 border border-green-200 dark:border-green-800 p-4">
-                <div className="flex items-center gap-2 text-green-800 dark:text-green-300 font-bold text-sm">
-                  <span>✓ Payment Verified Successfully!</span>
-                </div>
-                <div className="mt-1 text-xs text-green-700 dark:text-green-400">
-                  Transaction confirmed with zero fee. Now create your SubAdmin credentials to access your store dashboard.
-                </div>
-              </div>
-
-              <div className="mb-6">
-                <span className="text-xs font-bold uppercase tracking-[0.22em] text-[#a26d2d]">Account Creation</span>
-                <h2 className="mt-1 text-2xl font-black text-[#173c32] dark:text-[#f6f1ea]">
-                  Set your SubAdmin credentials
-                </h2>
-                <p className="mt-1 text-sm text-[#5d665f] dark:text-[#a0ada5]">
-                  This account registers as the <strong>SubAdmin (Store Manager)</strong> for{" "}
-                  <strong className="text-[#173c32] dark:text-white">{storeName}</strong>.
-                </p>
-              </div>
-
-              <form onSubmit={handleAccountCreation} className="space-y-4">
-                <label className="block text-sm font-semibold">
-                  Manager Full Name / Username
                   <input
-                    required
-                    type="text"
-                    value={ownerName}
-                    onChange={(e) => setOwnerName(e.target.value)}
-                    className="field"
-                    placeholder="e.g. Alex Henderson"
-                  />
-                </label>
-
-                <label className="block text-sm font-semibold">
-                  Store SubAdmin Email
-                  <input
-                    disabled
-                    type="email"
-                    value={email}
-                    className="field opacity-75 cursor-not-allowed bg-black/5 dark:bg-white/5"
-                  />
-                </label>
-
-                <label className="block text-sm font-semibold">
-                  Password
-                  <input
-                    required
                     type="password"
+                    required
                     value={password}
                     onChange={(e) => setPassword(e.target.value)}
-                    className="field"
-                    placeholder="At least 8 characters"
+                    placeholder="••••••••"
+                    className="w-full rounded-xl border border-[#ece4da] dark:border-white/10 bg-[#faf8f4] dark:bg-black/20 p-3 text-sm text-[#173c32] dark:text-white focus:outline-none focus:ring-2 focus:ring-[#173c32]"
                   />
-                </label>
-
-                <label className="block text-sm font-semibold">
-                  Confirm Password
+                </div>
+                <div>
+                  <label className="block text-xs font-bold text-[#173c32] dark:text-white mb-1">
+                    Confirm Password *
+                  </label>
                   <input
-                    required
                     type="password"
+                    required
                     value={confirmPass}
                     onChange={(e) => setConfirmPass(e.target.value)}
-                    className="field"
-                    placeholder="Repeat your password"
+                    placeholder="••••••••"
+                    className="w-full rounded-xl border border-[#ece4da] dark:border-white/10 bg-[#faf8f4] dark:bg-black/20 p-3 text-sm text-[#173c32] dark:text-white focus:outline-none focus:ring-2 focus:ring-[#173c32]"
                   />
-                </label>
+                </div>
+              </div>
 
+              <div className="pt-4">
                 <button
                   type="submit"
-                  disabled={submitting}
-                  className="w-full rounded-2xl bg-[#173c32] px-4 py-3.5 text-base font-bold text-white transition hover:bg-[#0f2d2b] disabled:opacity-60"
+                  disabled={registering || !otpVerified}
+                  className="w-full rounded-2xl bg-[#173c32] dark:bg-[#d7a35d] hover:bg-[#0f2d2b] dark:hover:bg-[#c28e46] py-3.5 text-sm font-black text-white dark:text-[#173c32] shadow-md transition disabled:opacity-50 touch-manipulation flex items-center justify-center gap-2"
                 >
-                  {submitting ? "Initializing Store & SubAdmin Account…" : "Create SubAdmin Account & Launch Store"}
+                  {registering ? "Initializing Store…" : "Continue to Payment Verification →"}
                 </button>
-              </form>
-            </div>
-          )}
-
-          {/* ──────────────── STEP 4: SUCCESS & LOGIN REDIRECT ──────────────── */}
-          {step === 4 && (
-            <div className="text-center py-4">
-              <div className="mx-auto mb-4 grid h-16 w-16 place-items-center rounded-full bg-emerald-100 dark:bg-emerald-950 text-3xl text-emerald-600">
-                🎉
               </div>
-              <h2 className="text-2xl font-black text-[#173c32] dark:text-[#f6f1ea]">
-                Store Created Successfully!
-              </h2>
-              <p className="mt-2 text-sm text-[#5d665f] dark:text-[#a0ada5] max-w-md mx-auto">
-                Your store <strong>{storeName}</strong> has been initialized in the system, and your default{" "}
-                <strong>SubAdmin</strong> account is active.
+
+              <p className="text-center text-xs text-[#5d665f] dark:text-[#a0ada5] pt-2">
+                Already registered?{" "}
+                <Link href="/login" className="font-bold text-[#173c32] dark:text-[#d7a35d] hover:underline">
+                  Sign in here
+                </Link>
+              </p>
+            </form>
+          </div>
+        )}
+
+        {/* ═════════════════════════════════════════════════════════════════════ */}
+        {/* STEP 2: NAYAPAY PAYMENT DETAILS & APPROVAL WORKFLOW */}
+        {/* ═════════════════════════════════════════════════════════════════════ */}
+        {step !== "register" && (
+          <div className="space-y-6">
+            {/* Payment Details Card */}
+            <div className="rounded-3xl border border-[#ece4da] dark:border-white/10 bg-white dark:bg-white/[0.03] p-6 sm:p-8 shadow-sm">
+              <div className="flex items-center justify-between gap-3 mb-4">
+                <div>
+                  <span className="text-[10px] font-black uppercase tracking-wider text-emerald-700 dark:text-emerald-400 bg-emerald-50 dark:bg-emerald-950/40 px-2.5 py-1 rounded-md border border-emerald-200 dark:border-emerald-800">
+                    Official NayaPay Account
+                  </span>
+                  <h2 className="text-lg font-black text-[#173c32] dark:text-white mt-1.5">
+                    Manual Payment Verification
+                  </h2>
+                </div>
+                <div className="h-10 w-10 rounded-2xl bg-emerald-100 dark:bg-emerald-950/60 flex items-center justify-center text-emerald-800 dark:text-emerald-300 font-black text-lg">
+                  ₦
+                </div>
+              </div>
+
+              <p className="text-xs text-[#5d665f] dark:text-[#a0ada5] leading-relaxed mb-6">
+                Please transfer your store subscription fee via the <strong>NayaPay app</strong> or online banking to the verified mobile account below:
               </p>
 
-              <div className="my-6 rounded-2xl bg-[#faf8f4] dark:bg-white/5 p-4 text-sm text-left max-w-md mx-auto space-y-2 border border-[#ece4da] dark:border-white/10">
-                <div className="flex justify-between">
-                  <span className="text-[#5d665f] dark:text-[#a0ada5]">Store Tenant:</span>
-                  <span className="font-bold text-[#173c32] dark:text-white">{storeName}</span>
-                </div>
-                <div className="flex justify-between">
-                  <span className="text-[#5d665f] dark:text-[#a0ada5]">Manager Account:</span>
-                  <span className="font-bold text-[#173c32] dark:text-white">{email}</span>
-                </div>
-                <div className="flex justify-between">
-                  <span className="text-[#5d665f] dark:text-[#a0ada5]">Assigned Role:</span>
-                  <span className="font-bold text-emerald-700 dark:text-emerald-400">SubAdmin (Default)</span>
+              {/* NayaPay Account Info Box */}
+              <div className="rounded-2xl border-2 border-dashed border-[#173c32]/30 dark:border-[#d7a35d]/40 bg-[#fbf9f5] dark:bg-black/30 p-4 sm:p-5 mb-6">
+                <div className="grid sm:grid-cols-2 gap-4">
+                  <div>
+                    <span className="block text-[11px] font-bold text-[#5d665f] dark:text-[#a0ada5] uppercase tracking-wider">
+                      Mobile Account Number
+                    </span>
+                    <div className="flex items-center gap-2 mt-1">
+                      <span className="font-mono text-xl sm:text-2xl font-black text-[#173c32] dark:text-[#edd3ab] tracking-wider">
+                        {NAYAPAY_ACCOUNT}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={handleCopyAccount}
+                        className="rounded-lg bg-[#e8e2d8] dark:bg-white/10 hover:bg-[#dcd4c7] px-2 py-1 text-[11px] font-bold text-[#173c32] dark:text-white transition touch-manipulation"
+                      >
+                        {copiedAccount ? "Copied!" : "Copy"}
+                      </button>
+                    </div>
+                  </div>
+
+                  <div>
+                    <span className="block text-[11px] font-bold text-[#5d665f] dark:text-[#a0ada5] uppercase tracking-wider">
+                      Account Title / Bank
+                    </span>
+                    <span className="block text-base font-bold text-[#173c32] dark:text-white mt-1">
+                      {NAYAPAY_TITLE}
+                    </span>
+                  </div>
                 </div>
               </div>
 
-              <div className="space-y-3 max-w-md mx-auto">
-                <Link
-                  href={`/login?role=SubAdmin&email=${encodeURIComponent(email)}`}
-                  className="block w-full rounded-2xl bg-[#d7a35d] px-4 py-3.5 text-base font-bold text-[#173c32] transition hover:bg-[#c98d41]"
-                >
-                  Proceed to Login as SubAdmin →
-                </Link>
-                <Link
-                  href="/"
-                  className="block text-xs font-semibold text-[#5d665f] dark:text-[#a0ada5] hover:underline"
-                >
-                  Return to Home
+              {/* Rejection Alert (If previous submission was rejected) */}
+              {step === "rejected" && (
+                <div className="mb-6 rounded-2xl border border-red-300 dark:border-red-900 bg-red-50 dark:bg-red-950/40 p-4 text-xs text-red-800 dark:text-red-200">
+                  <div className="font-bold flex items-center gap-1.5 text-sm mb-1 text-red-900 dark:text-red-300">
+                    <span>⚠️</span> Verification Request Rejected by Admin
+                  </div>
+                  <p className="leading-relaxed">
+                    <strong>Reason:</strong> {rejectionReason || "Payment could not be verified on NayaPay account 03217253923."}
+                  </p>
+                  <p className="mt-2 text-[11px] text-red-700 dark:text-red-400 font-semibold">
+                    The verification button has been re-activated below. Please ensure your payment has been sent and update your account holder name before resubmitting.
+                  </p>
+                </div>
+              )}
+
+              {/* Waiting State Banner */}
+              {step === "waiting" && (
+                <div className="mb-6 rounded-2xl border border-amber-300 dark:border-amber-800 bg-amber-50 dark:bg-amber-950/40 p-5 text-xs text-amber-900 dark:text-amber-200 shadow-sm animate-pulse">
+                  <div className="flex items-center gap-2 text-sm font-bold text-amber-900 dark:text-amber-300 mb-2">
+                    <span className="animate-spin text-base">⏳</span>
+                    <span>Waiting for System Administrator Approval...</span>
+                  </div>
+                  <p className="leading-relaxed">
+                    Your verification request for sender <strong>"{senderName}"</strong> has been delivered to the Admin console.
+                  </p>
+                  <p className="mt-2 text-[11px] text-amber-800 dark:text-amber-400">
+                    The verification button is locked while your request is pending review. This screen automatically updates the moment the Admin approves your store.
+                  </p>
+                </div>
+              )}
+
+              {/* Active Success Screen */}
+              {step === "active" && (
+                <div className="mb-6 rounded-2xl border border-emerald-300 dark:border-emerald-800 bg-emerald-50 dark:bg-emerald-950/40 p-5 text-xs text-emerald-900 dark:text-emerald-200">
+                  <div className="flex items-center gap-2 text-sm font-bold text-emerald-900 dark:text-emerald-300 mb-1">
+                    <span>🎉</span> Store Approved & Active!
+                  </div>
+                  <p>Redirecting you to your SubAdmin dashboard now…</p>
+                </div>
+              )}
+
+              {/* Sender Name Form & Single-Click Verification Button */}
+              <form onSubmit={handleSubmitPaymentVerification} className="space-y-4">
+                <div>
+                  <label className="block text-xs font-bold text-[#173c32] dark:text-white mb-1">
+                    Sender Account Holder Name *{" "}
+                    <span className="text-[#a26d2d] dark:text-[#d7a35d] font-normal">
+                      (jo account mn payment send kr ga)
+                    </span>
+                  </label>
+                  <input
+                    type="text"
+                    required
+                    disabled={step === "waiting" || step === "active"}
+                    value={senderName}
+                    onChange={(e) => setSenderName(e.target.value)}
+                    placeholder="Enter the exact account holder title used to send payment"
+                    className="w-full rounded-xl border border-[#ece4da] dark:border-white/10 bg-[#faf8f4] dark:bg-black/20 p-3 text-sm text-[#173c32] dark:text-white placeholder-[#8a948c] focus:outline-none focus:ring-2 focus:ring-[#173c32] disabled:opacity-60"
+                  />
+                  <span className="block text-[11px] text-[#5d665f] dark:text-[#a0ada5] mt-1">
+                    Mandatory field: Admin will cross-reference this name with incoming NayaPay statements.
+                  </span>
+                </div>
+
+                <div className="pt-2">
+                  <button
+                    type="submit"
+                    disabled={
+                      submittingPayment ||
+                      step === "waiting" ||
+                      step === "active" ||
+                      !senderName.trim()
+                    }
+                    className={`w-full rounded-2xl py-3.5 text-sm font-black shadow-md transition touch-manipulation flex items-center justify-center gap-2 ${
+                      step === "waiting"
+                        ? "bg-amber-600/80 text-white cursor-not-allowed opacity-75"
+                        : step === "active"
+                        ? "bg-emerald-600 text-white cursor-not-allowed"
+                        : "bg-[#173c32] dark:bg-[#d7a35d] hover:bg-[#0f2d2b] dark:hover:bg-[#c28e46] text-white dark:text-[#173c32] disabled:opacity-50"
+                    }`}
+                  >
+                    {submittingPayment
+                      ? "Submitting to Admin…"
+                      : step === "waiting"
+                      ? "⏳ Verification Under Review by Admin (Locked)"
+                      : step === "active"
+                      ? "✓ Approved! Redirecting…"
+                      : step === "rejected"
+                      ? "Resubmit Payment for Verification"
+                      : "Submit for Verification (One-Time)"}
+                  </button>
+                </div>
+              </form>
+
+              <div className="mt-6 pt-4 border-t border-[#ece4da] dark:border-white/10 flex flex-wrap items-center justify-between text-xs text-[#5d665f] dark:text-[#a0ada5]">
+                <span>Status: <strong className="uppercase font-mono text-[#173c32] dark:text-white">{tenantStatus}</strong></span>
+                <Link href="/login" className="font-bold text-[#173c32] dark:text-[#d7a35d] hover:underline">
+                  Back to Sign In
                 </Link>
               </div>
             </div>
-          )}
-        </div>
+          </div>
+        )}
       </div>
     </main>
   );
 }
-

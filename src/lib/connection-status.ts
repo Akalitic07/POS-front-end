@@ -1,5 +1,7 @@
 type ConnectionListener = (online: boolean) => void;
 
+import { isAppSyncConfigured, graphqlRequest } from './appsync-client';
+
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:4000';
 const HEALTH_INTERVAL_MS = 15000;
 
@@ -26,9 +28,26 @@ function setOnline(value: boolean) {
   }
 }
 
-// Ping the backend health endpoint to confirm real connectivity
+// Ping the cloud backend (AppSync GraphQL or Express health endpoint) to confirm real connectivity
 async function checkHealth(): Promise<boolean> {
   if (typeof navigator !== 'undefined' && !navigator.onLine) return false;
+
+  // Cloud Mode: Ping AppSync
+  if (isAppSyncConfigured()) {
+    try {
+      const data = await Promise.race([
+        graphqlRequest<{ __typename: string }>('query HealthPing { __typename }'),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error('AppSync timeout')), 5000)
+        ),
+      ]);
+      return Boolean(data && data.__typename);
+    } catch {
+      return false;
+    }
+  }
+
+  // Local / Express Fallback Mode
   try {
     const res = await fetch(`${API_URL}/health`, {
       signal: AbortSignal.timeout(5000),
@@ -58,33 +77,33 @@ const handleVisibility = () => {
 };
 
 export function startConnectionMonitor(): void {
-  if (typeof window === 'undefined') return;
-
   monitorRefs += 1;
   if (monitorRefs > 1) return;
+
+  if (typeof window === 'undefined') return;
 
   window.addEventListener('online', handleOnline);
   window.addEventListener('offline', handleOffline);
   document.addEventListener('visibilitychange', handleVisibility);
 
-  if (healthCheckInterval) clearInterval(healthCheckInterval);
-  healthCheckInterval = setInterval(() => {
-    if (typeof document !== 'undefined' && document.visibilityState === 'visible') {
-      void recheck();
-    }
-  }, HEALTH_INTERVAL_MS);
-
   void recheck();
+
+  healthCheckInterval = setInterval(() => {
+    void recheck();
+  }, HEALTH_INTERVAL_MS);
 }
 
 export function stopConnectionMonitor(): void {
-  if (typeof window === 'undefined' || monitorRefs === 0) return;
+  if (monitorRefs <= 0) return;
   monitorRefs -= 1;
   if (monitorRefs > 0) return;
+
+  if (typeof window === 'undefined') return;
 
   window.removeEventListener('online', handleOnline);
   window.removeEventListener('offline', handleOffline);
   document.removeEventListener('visibilitychange', handleVisibility);
+
   if (healthCheckInterval) {
     clearInterval(healthCheckInterval);
     healthCheckInterval = null;

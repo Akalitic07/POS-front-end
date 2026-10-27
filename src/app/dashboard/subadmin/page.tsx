@@ -58,6 +58,19 @@ function SubAdminContent() {
     }
   }, [searchParams]);
 
+  // Guard: Ensure tenant is active before allowing access to SubAdmin operations
+  useEffect(() => {
+    if (token && user?.role === "SubAdmin" && user.tenantId) {
+      getJson<{ tenant: any }>("/api/tenants/my-status", token)
+        .then((res) => {
+          if (res?.tenant && res.tenant.status !== "active") {
+            router.replace("/get-access");
+          }
+        })
+        .catch(() => {});
+    }
+  }, [token, user?.role, user?.tenantId, router]);
+
   const switchTab = (tab: TabType) => {
     setActiveTab(tab);
     router.replace(`/dashboard/subadmin?tab=${tab}`);
